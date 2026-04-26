@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
-import { supabase } from "@/lib/supabase";
 import { toast } from "@/components/ui/sonner";
 import { AlertTriangle, Clock, Fingerprint, CreditCard, Eye } from "lucide-react";
+import { connectLiveAlerts, type LiveAlert } from "@/lib/mqttLiveAlerts";
 
 const reasonIcons: Record<string, typeof AlertTriangle> = {
   unknown_card: CreditCard,
@@ -15,6 +15,9 @@ const reasonLabels: Record<string, string> = {
   loitering: "Loitering Detected",
   duplicate_scan: "Duplicate Scan",
   after_hours: "After Hours Entry",
+  mismatch: "Mismatch",
+  polling: "Polling (LED Control)",
+  led_control: "LED Control",
 };
 
 type FailedAttempt = {
@@ -26,47 +29,51 @@ type FailedAttempt = {
 
 const AlertsPanel = ({ fullPage = false }: { fullPage?: boolean }) => {
   const [alerts, setAlerts] = useState<FailedAttempt[]>([]);
-  const hasLoadedOnce = useRef(false);
-  const latestSeenRef = useRef<string | null>(null);
+  const [mqttConnected, setMqttConnected] = useState<boolean | null>(null);
+  const [mqttError, setMqttError] = useState<string | null>(null);
+  const seenIdsRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
-    if (!supabase) return;
+    const url = import.meta.env.VITE_MQTT_URL as string | undefined;
+    const username = import.meta.env.VITE_MQTT_USERNAME as string | undefined;
+    const password = import.meta.env.VITE_MQTT_PASSWORD as string | undefined;
+    const topic = (import.meta.env.VITE_MQTT_TOPIC_ALERTS as string | undefined) ?? "smartscan/alerts";
 
-    const fetchAlerts = async () => {
-      const { data, error } = await supabase
-        .from("failed_attempts")
-        .select("*")
-        .order("timestamp", { ascending: false });
+    if (!url || !username || !password) {
+      console.log("MQTT not configured. Add VITE_MQTT_URL, VITE_MQTT_USERNAME, VITE_MQTT_PASSWORD.");
+      setMqttConnected(null);
+      return;
+    }
 
-      if (error) {
-        console.log("Failed to fetch alerts:", error);
-        return;
-      }
+    const { disconnect } = connectLiveAlerts({
+      url,
+      username,
+      password,
+      topic,
+      onStatus: ({ connected, error }) => {
+        setMqttConnected(connected);
+        setMqttError(error ?? null);
+        if (error) toast.error(`MQTT error: ${error}`);
+      },
+      onAlert: (incoming: LiveAlert) => {
+        if (seenIdsRef.current.has(incoming.id)) return;
+        seenIdsRef.current.add(incoming.id);
 
-      const nextAlerts = (data as FailedAttempt[]) ?? [];
-      setAlerts(nextAlerts);
+        const next: FailedAttempt = {
+          id: incoming.id,
+          reason: incoming.reason,
+          timestamp: incoming.timestamp,
+          card_id: incoming.card_id ?? null,
+        };
 
-      const latest = nextAlerts[0];
-      const latestToken = latest ? `${latest.id}-${latest.timestamp ?? ""}` : null;
-      if (!hasLoadedOnce.current) {
-        latestSeenRef.current = latestToken;
-        hasLoadedOnce.current = true;
-        return;
-      }
+        setAlerts((prev) => [next, ...prev].slice(0, 50));
 
-      if (latestToken && latestToken !== latestSeenRef.current) {
-        latestSeenRef.current = latestToken;
-        const latestReason = latest.reason ?? "Unknown alert";
-        toast.error(`New alert: ${reasonLabels[latestReason] || latestReason}`);
-      }
-    };
+        const r = incoming.reason ?? "Unknown alert";
+        toast.error(`New alert: ${reasonLabels[r] || r}`);
+      },
+    });
 
-    fetchAlerts();
-    const intervalId = window.setInterval(fetchAlerts, 4000);
-
-    return () => {
-      window.clearInterval(intervalId);
-    };
+    return () => disconnect();
   }, []);
 
   const visibleAlerts = fullPage ? alerts : alerts.slice(0, 10);
@@ -76,6 +83,19 @@ const AlertsPanel = ({ fullPage = false }: { fullPage?: boolean }) => {
       <h3 className="text-sm font-semibold text-foreground mb-4 flex items-center gap-2">
         <AlertTriangle className="w-4 h-4 text-destructive" />
         Security Alerts
+        <span
+          className={[
+            "ml-auto text-[11px] px-2 py-0.5 rounded-full border",
+            mqttConnected === true
+              ? "bg-emerald-500/10 text-emerald-600 border-emerald-500/20"
+              : mqttConnected === false
+                ? "bg-destructive/10 text-destructive border-destructive/20"
+                : "bg-muted/40 text-muted-foreground border-border",
+          ].join(" ")}
+          title={mqttError ?? "MQTT status"}
+        >
+          {mqttConnected === true ? "MQTT: connected" : mqttConnected === false ? "MQTT: disconnected" : "MQTT: not configured"}
+        </span>
       </h3>
       <div className={`space-y-2 overflow-y-auto pr-1 ${fullPage ? "max-h-[600px]" : "max-h-[400px]"}`}>
         {visibleAlerts.map((alert) => {
